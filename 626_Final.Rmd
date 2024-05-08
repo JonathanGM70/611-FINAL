@@ -1,0 +1,235 @@
+---
+title: "BIO 626 FINAL"
+author: "Jonathan Miller"
+date: "`r Sys.Date()`"
+output: 
+  rmdformats::readthedown
+---
+This Rmd file contains all the necessary scripts for running DEU analysis, visualizing exon expression at the gene level, and conducting a simple analysis of DEU using a selected gene with known DEU. This script only focuses on the new DEU analysis and not the more commonly used DGE analysis. 
+```{r Load Libraries, echo=TRUE, results='hide', error=FALSE, warning=FALSE, message=FALSE}
+### Read in needed libraries
+library(Rsubread)
+library(edgeR)
+library(org.Mm.eg.db)
+library(tidyverse)
+library(car)
+library(lme4)
+library(emmeans)
+library(glmmTMB)
+```
+
+There are many different ways to begin the analysis using aligned reads, the most common aligner used in the Enke lab is HISAT2, due to the ease of use, speed, and accuracy. To begin analysis, any bam files will work.
+```{r Load in Aligned Reads from HISAT2, echo=TRUE, results='hide', error=FALSE, warning=FALSE, message=FALSE}
+### Load in all of your .bam aligned and paired files that you will analyze for DEU here, only put the file path to your folder with all your files and R will do the rest!
+bam1 <- dir('/Volumes/Extra Data/Mcoln1/HISAT Bam/D', pattern = '*.bam', include.dirs = TRUE, full.names = TRUE)
+bam1 <- bam1[c(2,4,5,6,7)]
+
+bam2 <- dir('/Volumes/Extra Data/Mcoln1/HISAT Bam/D', pattern = '*.bam', include.dirs = TRUE, full.names = TRUE)
+bam2 <- bam2[c(1,3,8,9)]
+
+bam <- append(bam1,bam2)
+```
+
+FeatureCounts must be used for this pipeline, because of its updated ability to also count exons along with genes. 
+```{r Running featureCounts to Count Exons}
+### This will run featureCounts locally so that it will count exons instead of whole genes, you must put in the file path for you .gtf file that is your reference genome. This is a long process and may take ~15-20 mins.
+featureCounts <- featureCounts(bam, isPairedEnd = TRUE, annot.inbuilt = 'mm39', useMetaFeatures = FALSE, allowMultiOverlap = TRUE)
+
+test <- as.data.frame(featureCounts$counts)
+head(test)
+```
+
+EdgeR 4.0 is the main tool to use when calculating DEU along with DGE. Each of these lines are annotated for their important purpose along calculating DEU in various forms of data. 
+```{r Main Block for DEU Analysis, echo=TRUE, error=FALSE, warning=FALSE, message=FALSE}
+### This next function will detect the total number of exons within your data sets
+y <- DGEList(counts = test, genes = featureCounts$annotation)
+
+y$genes$GeneID <- as.character(y$genes$GeneID)
+
+### These next few lines map gene symbols and definitions to the ensemble gene IDs
+symbol <- mapIds(org.Mm.eg.db, keys = y$genes$GeneID, keytype = "ENTREZID", column = "SYMBOL", multiVals = "first")
+y$genes$symbol <- symbol
+
+definition <- mapIds(org.Mm.eg.db, keys = y$genes$GeneID, keytype = "ENTREZID", column = "GENENAME", multiVals = "first")
+y$genes$definition <- definition
+
+head(y$genes)
+
+### These next few lines will label what samples go with which treatment groups you are testing, while also omitting low exon expression
+group <- gsub("-[1-3]$","",colnames(y))
+group <- factor(gsub("-","_",group))
+group <- factor(c('WT','WT','WT','WT','WT','KO','KO','KO','KO'))
+y$samples$group <- group
+keep <- filterByExpr(y, group = group)
+
+### These next lines will normalize all your data
+y <- y[keep, , keep.lib.sizes=FALSE]
+y <- normLibSizes(y)
+
+### Use this line of code to double check that your samples match up with your treatment names
+y$samples
+```
+
+This will create a cool MDS plot of each of the individuals in the study
+```{r MDS Plot}
+plotMDS(y, col=c(1:4)[group])
+```
+
+```{r Group Design}
+### These lines are creating the matrix to conduct DEU based on the treatments we assigned the individuals to 
+design <- model.matrix(~ 0 + group)
+colnames(design) <- gsub('group', '', colnames(design))
+
+### These lines are estimating the dispersion of our data set
+y <- estimateDisp(y, design, robust = TRUE)
+y$common.dispersion
+```
+
+This will create a BCV plot, showing us variation within our data
+```{r BCV Plot}
+plotBCV(y)
+```
+
+This will create a negative binomial model that will hopefully fit our data
+```{r Fitting the data to a negative binomial model}
+### This line is running the quasi-likelihood negative binomial model on our count data
+fit <- glmQLFit(y, design, robust = TRUE)
+
+### This will create a QL plot, showing us the fit of the negative binomial on our data set
+plotQLDisp(fit)
+```
+
+After fittin the data to a model, we will now detect DEU
+```{r DEU Analysis}
+### These next few lines will determine some of the most DEU in exons to view
+contr <- makeContrasts(KO - WT, levels=design)
+qlf <- glmQLFTest(fit, contrast=contr)
+
+### These lines of code determine if there is any significant DEU in your data set
+is.de <- decideTests(qlf, p.value=0.05)
+
+### This is the main function that will determine DEU in your data set
+sp <- diffSpliceDGE(fit, contrast=contr, geneid="GeneID", exonid="Start")
+
+### This function will spit out a list of the most differentially expressed exons
+topExons <- topSpliceDGE(sp, test="exon", n=Inf)
+```
+
+These lines will plot a single gene with DEU, calculated by our DEU analysis. The Phb2 gene is chosen here
+```{r Plotting a single gene with DEU}
+par(mfrow=c(1,2))
+
+### You can create DEU visualizations of specific genes using this function, just specify the gene symbol
+plotSpliceDGE(sp, geneid="Phb2", genecol="symbol")
+```
+
+These lines will further help us investigate other instances of DEU within our dataset
+```{r Looking at other DEU genes}
+### These lines determine some of the most DEU in the entire exon output, looking at exons that have an FDR < 0.05 and a logFC > 1 or < -1
+interest <- topExons %>%
+  filter(FDR < 0.05)
+interest <- interest %>%
+  filter(logFC>1|logFC< -1)
+head(interest)
+```
+
+Using ggTranscript, we can better visualize the exons and introns within our Phb2 gene. Mapping DEU to each exon can illustrate the individual exons with significant DEU.
+```{r Visualizing the Phb2 Transcript with ggTranscript}
+library(ggtranscript)
+library(magrittr)
+
+### These lines assign color values to numerical values, correlating to relative expression
+colors <- c('chartreuse','azure3','azure3','red1')
+ranges <- c(-Inf,-0.5,0,.5,Inf)
+
+### Further tidying the Phb2 exon dataset for visualizing
+phb2 <- y$genes %>%
+  filter(symbol == 'Phb2') 
+phb2$transcript_biotype <- 'protein_coding'
+phb2$transcript_name <- 'Phb2'
+phb2 <- phb2 %>% rename(start = Start)
+phb2 <- phb2 %>% rename(end = End)
+fcPhb2 <- topExons %>%
+  filter(symbol == 'Phb2')
+finalPhb2 <- merge(phb2, fcPhb2[, "logFC", drop = FALSE], by = "row.names", all = TRUE)
+
+### Using ggTranscript, a neat image of the exons can be created, while also mapping their relative expression to each exon, however the only DEU is detected in exon 9 and the color cannot be properly shown because the exon is so small, but trust me this code works and its very cool :)
+ggplot(aes(xstart=start,xend=end,y=symbol), data=finalPhb2) +
+  geom_range(aes(fill=logFC)) +
+  geom_intron(data = to_intron(phb2,'transcript_name'), aes(strand = Strand)) +
+  scale_fill_gradientn(name='logFC',colors=colors,breaks=c(-1,0,1),values=c(-1,0,1)) +
+  labs(x = 'Genomic Position (chr6)', y = 'Gene Transcript')  +
+  ggtitle('Phb2 Exon Expression in KO D vs WT D') +
+  theme(plot.title = element_text(face = 'bold', size = 15)) +
+  theme_bw(base_size = 13)
+```
+
+This script pulls out the original exon counts for Phb2, to run a similar analysis using my own methods. First we must tidy the data
+```{r Tidying the Phb2 exon dataset from Mcoln1 mice}
+### This line pulls out the Phb2 gene exons from the featureCounts output
+phb2Maybe <- test[grep('X12034',row.names(test)),]
+
+### These next few lines tidy the data into a format that can be better analyzed and visualized 
+data <- rownames_to_column(phb2Maybe, var = 'Exon')
+data <- pivot_longer(data = data, cols = -Exon, names_to = 'Sample', values_to = 'Count')
+data$Group <- 'Wildtype'
+data$Group[data$Sample == 'D01_R1_001.sorted.bam'] <- 'Mutant'
+data$Group[data$Sample == 'D05_R1_001.sorted.bam'] <- 'Mutant'
+data$Group[data$Sample == 'RESUB.D03_R1_001.sorted.bam'] <- 'Mutant'
+data$Group[data$Sample == 'RESUB.D06_R1_001.sorted.bam'] <- 'Mutant'
+
+data$Exon[data$Exon == 'X12034'] <- 'Exon1'
+data$Exon[data$Exon == 'X12034.1'] <- 'Exon2'
+data$Exon[data$Exon == 'X12034.2'] <- 'Exon3'
+data$Exon[data$Exon == 'X12034.3'] <- 'Exon4'
+data$Exon[data$Exon == 'X12034.4'] <- 'Exon5'
+data$Exon[data$Exon == 'X12034.5'] <- 'Exon6'
+data$Exon[data$Exon == 'X12034.6'] <- 'Exon7'
+data$Exon[data$Exon == 'X12034.7'] <- 'Exon8'
+data$Exon[data$Exon == 'X12034.8'] <- 'Exon9'
+data$Exon[data$Exon == 'X12034.9'] <- 'Exon10'
+
+data$Exon <- as.factor(data$Exon)
+
+data$Exon <- fct_relevel(data$Exon, 'Exon1','Exon2','Exon3','Exon4','Exon5','Exon6','Exon7','Exon8','Exon9','Exon10')
+```
+
+This will create a ggplot of the exon counts for our two treatments in the Phb2 transcript. We may also be able to notice any peculiarities within their counts here 
+```{r ggPlot}
+### Creates a ggplot on the raw exon counts for all exons in the Phb2 transcript
+ggplot(data, aes(x=Exon, y=Count, color = Group)) +
+  geom_boxplot() +
+  ggtitle('Raw Exon Expression of Phb2 in Mice Groups') +
+  ylab('mRNA Counts') +
+  xlab('Exon #') +
+  theme_classic()
+```
+
+These scripts are my attempts at fitting several models to the Phb2 exon count data, followed by a more stringent pairwise analysis. This first chunk is the Poisson model
+```{r Running my own analysis on Phb2 DEU in Mcoln1 mice}
+### This code runs a poisson distribution on the exon count data, as this model was believed to best fit the data
+mod <- glmer(Count ~ Group + (1|Sample) + Exon, family = 'poisson', data = data)
+summary(mod)
+```
+
+The Poisson model doesn't fit well, so lets check for over dispersion
+```{r Over Dispersion}
+### After the Poisson model did not fit the data well, over dispersion is checked and found the data to be over dispersed
+deviance(mod)/df.residual(mod)
+```
+
+Now lets go back to using a negative binomial model
+```{r Negative Binomial Model}
+### Due to calculated over dispersion, running the suggested negative binomial model is chosen for re-analysis
+mod2 <- glmmTMB(Count ~ Group + (1|Sample) + Exon, data = data, family = nbinom2)
+summary(mod2)
+```
+
+That fits much better, now we run a stronger analysis for pairwise differences in exons
+```{r Bonferroni}
+### Using a Bonferroni method for a more stringent genewise analysis will provide a better detection of DEU amongst exons in the Phb2 transcript
+bon <- emmeans(mod2, ~ Exon + Group, type = 'Count')
+bonfer <- pairs(bon, adjust = 'bonferroni')
+head(bonfer)
+```
+COOL. We were able to also detect only significant DEU in exon 9, similar to our DEU tool. They used a Benjamini-Hochberg analysis, but here we use a Bonferroni method, still cool and supports our previous findings :)
